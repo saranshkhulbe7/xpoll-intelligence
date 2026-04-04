@@ -23,7 +23,7 @@ import {
   upsertQdrantImportState,
 } from "./importLedger";
 import { chooseResumeDecision, getHighestAttemptCount } from "./importStateMachine";
-import { inferPollSemanticTemplate, materializeVoteSemantics } from "./semanticInference";
+import { ensureValidPollSemanticTemplate, inferPollSemanticTemplate, materializeVoteSemantics } from "./semanticInference";
 import {
   logGraphPlan,
   logLlmInput,
@@ -204,6 +204,7 @@ async function loadPollTemplate(
 ): Promise<NonNullable<ResolvedVoteArtifact["pollTemplate"]>> {
   const pollKey = dependencies.buildPollKey(args.vote);
   const pollFingerprint = dependencies.buildPollFingerprint(args.vote);
+  const context = dependencies.buildPollTemplateContext(args.vote);
   const existingTemplate =
     args.record.pollTemplate &&
     args.record.pollTemplate.pollKey === pollKey &&
@@ -212,7 +213,11 @@ async function loadPollTemplate(
       : null;
 
   if (existingTemplate) {
-    return existingTemplate;
+    return ensureValidPollSemanticTemplate({
+      vote: args.vote,
+      context,
+      template: existingTemplate,
+    });
   }
 
   const persistedTemplate = await dependencies.findQdrantPollTemplate({
@@ -221,10 +226,12 @@ async function loadPollTemplate(
   });
 
   if (persistedTemplate) {
-    return persistedTemplate;
+    return ensureValidPollSemanticTemplate({
+      vote: args.vote,
+      context,
+      template: persistedTemplate,
+    });
   }
-
-  const context = dependencies.buildPollTemplateContext(args.vote);
   logLlmInput({
     vote: args.vote,
     selectedOption: args.selectedOption,

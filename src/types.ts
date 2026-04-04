@@ -25,6 +25,7 @@ export type AssertionTargetKind = Exclude<SubjectKind, "ideology">;
 export type RegistryEntryKind = "subject";
 export type RelationPolarity = "positive" | "negative" | "neutral";
 export type RegistryMatchType = "exact" | "vector" | "created";
+export type IntensityBand = "weak" | "medium" | "strong";
 
 export type RawVote = {
   type: VoteItemType | string;
@@ -122,6 +123,7 @@ export type PollSemanticTemplate = {
     targetKind: AssertionTargetKind;
     relationFamily: string;
     polarity: RelationPolarity;
+    intensityBand: IntensityBand;
     aliases?: string[];
     notes: string[];
   }>;
@@ -137,6 +139,8 @@ export type InferredSemantics = {
     aboutTopicLabel?: string;
     ideologyHint?: string;
     confidence?: number;
+    intensityBand?: IntensityBand;
+    baseIntensityContribution?: number;
     notes: string[];
   }>;
   notes: string[];
@@ -161,6 +165,9 @@ export type ResolvedAssertion = {
   polarity: RelationPolarity;
   target: ResolvedSubject;
   aboutTopic?: ResolvedSubject | null;
+  assertionGroupKey: string;
+  intensityBand: IntensityBand;
+  baseIntensityContribution: number;
   confidence: number;
   notes: string[];
 };

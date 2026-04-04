@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { neo4jDriver } from "../db/neo4j";
 import { config } from "../config";
-import type { RawVote, ResolvedSubject, ResolvedVoteArtifact, SubjectKind } from "../types";
+import type { RawVote, RelationPolarity, ResolvedSubject, ResolvedVoteArtifact, SubjectKind } from "../types";
 import { getSelectedOption } from "./contextBuilder";
 import { markNeo4jDone } from "./importLedger";
+import { intensityBandToContribution, updateIntensityState } from "../utils/intensity";
 
 function subjectLabel(kind: SubjectKind): string {
   switch (kind) {
@@ -20,6 +21,40 @@ function subjectLabel(kind: SubjectKind): string {
 
 function buildSupportKey(processingKey: string): string {
   return `support_${createHash("sha256").update(processingKey).digest("hex").slice(0, 32)}`;
+}
+
+function buildFallbackAssertionGroupKey(args: {
+  userId: string;
+  relationFamily: string;
+  targetSubjectId: string;
+  aboutTopicId?: string | null;
+}): string {
+  const groupSource = [args.userId, args.relationFamily, args.targetSubjectId, args.aboutTopicId ?? ""].join("::");
+  return `assertion_group_${createHash("sha256").update(groupSource).digest("hex").slice(0, 32)}`;
+}
+
+function oppositePolarity(polarity: RelationPolarity): RelationPolarity | null {
+  if (polarity === "positive") {
+    return "negative";
+  }
+
+  if (polarity === "negative") {
+    return "positive";
+  }
+
+  return null;
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+function toNumber(value: unknown): number {
+  return typeof value === "number" ? value : Number(value ?? 0);
+}
+
+function toOptionalString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 async function ensureSubjectNode(tx: any, subject: ResolvedSubject): Promise<void> {
@@ -104,6 +139,21 @@ export async function writeVoteToGraph(args: {
           await ensureSubjectNode(tx, assertion.aboutTopic);
         }
 
+        const now = new Date().toISOString();
+        const intensityBand = assertion.intensityBand ?? "medium";
+        const baseIntensityContribution =
+          typeof assertion.baseIntensityContribution === "number" && Number.isFinite(assertion.baseIntensityContribution)
+            ? assertion.baseIntensityContribution
+            : intensityBandToContribution(intensityBand);
+        const assertionGroupKey =
+          assertion.assertionGroupKey ??
+          buildFallbackAssertionGroupKey({
+            userId: vote.voter.externalAccountId,
+            relationFamily: assertion.relationFamily,
+            targetSubjectId: assertion.target.canonicalId,
+            aboutTopicId: assertion.aboutTopic?.canonicalId ?? null,
+          });
+
         const mergeResult = await tx.run(
           `
           MATCH (u:User {externalAccountId: $externalAccountId})
@@ -112,15 +162,22 @@ export async function writeVoteToGraph(args: {
           ON CREATE SET a.assertionId = $assertionSignature,
                         a.createdAt = $now,
                         a.evidenceCount = 0,
-                        a.appliedSupportKeys = []
+                        a.appliedSupportKeys = [],
+                        a.intensityMass = 0,
+                        a.currentIntensity = 0
           SET a.relationId = $relationId,
               a.relationLabel = $relationLabel,
               a.relationFamily = $relationFamily,
               a.polarity = $polarity,
-              a.confidence = $confidence
+              a.confidence = $confidence,
+              a.assertionGroupKey = $assertionGroupKey,
+              a.intensityBand = $intensityBand,
+              a.baseIntensityContribution = $baseIntensityContribution
           MERGE (u)-[:MADE_ASSERTION]->(a)
           MERGE (a)-[:TARGETS]->(target)
-          RETURN coalesce(a.appliedSupportKeys, []) AS appliedSupportKeys
+          RETURN coalesce(a.appliedSupportKeys, []) AS appliedSupportKeys,
+                 coalesce(a.intensityMass, 0) AS intensityMass,
+                 a.lastIntensityDecayAt AS lastIntensityDecayAt
           `,
           {
             externalAccountId: vote.voter.externalAccountId,
@@ -131,17 +188,59 @@ export async function writeVoteToGraph(args: {
             relationFamily: assertion.relationFamily,
             polarity: assertion.polarity,
             confidence: assertion.confidence,
-            now: new Date().toISOString(),
+            assertionGroupKey,
+            intensityBand,
+            baseIntensityContribution,
+            now,
           },
         );
 
-        const appliedSupportKeys = mergeResult.records[0]?.get("appliedSupportKeys");
-        const alreadyApplied = Array.isArray(appliedSupportKeys)
-          ? appliedSupportKeys.map(String).includes(supportKey)
-          : false;
+        const appliedSupportKeys = toStringArray(mergeResult.records[0]?.get("appliedSupportKeys"));
+        const alreadyApplied = appliedSupportKeys.includes(supportKey);
 
         if (!alreadyApplied) {
           allAssertionsAlreadyApplied = false;
+          const ownMass = toNumber(mergeResult.records[0]?.get("intensityMass"));
+          const ownLastDecayAt = toOptionalString(mergeResult.records[0]?.get("lastIntensityDecayAt"));
+          const oppositeAssertionPolarity = oppositePolarity(assertion.polarity);
+          let oppositeAssertionSignature: string | null = null;
+          let oppositeMass = 0;
+          let oppositeLastDecayAt: string | null = null;
+
+          if (oppositeAssertionPolarity) {
+            const oppositeResult = await tx.run(
+              `
+              MATCH (opposite:Assertion {
+                assertionGroupKey: $assertionGroupKey,
+                polarity: $oppositePolarity
+              })
+              RETURN opposite.assertionSignature AS assertionSignature,
+                     coalesce(opposite.intensityMass, 0) AS intensityMass,
+                     opposite.lastIntensityDecayAt AS lastIntensityDecayAt
+              LIMIT 1
+              `,
+              {
+                assertionGroupKey,
+                oppositePolarity: oppositeAssertionPolarity,
+              },
+            );
+
+            oppositeAssertionSignature = toOptionalString(oppositeResult.records[0]?.get("assertionSignature"));
+            oppositeMass = toNumber(oppositeResult.records[0]?.get("intensityMass"));
+            oppositeLastDecayAt = toOptionalString(oppositeResult.records[0]?.get("lastIntensityDecayAt"));
+          }
+
+          const nextIntensityState = updateIntensityState({
+            ownMass,
+            ownLastDecayAt,
+            oppositeMass,
+            oppositeLastDecayAt,
+            eventAt: evidenceTimestamp,
+            baseContribution: baseIntensityContribution,
+            halfLifeDays: config.intensity.halfLifeDays,
+            suppressionFactor: config.intensity.oppositeSuppression,
+          });
+
           await tx.run(
             `
             MATCH (a:Assertion {assertionSignature: $assertionSignature})
@@ -156,6 +255,13 @@ export async function writeVoteToGraph(args: {
                 a.latestPollTitle = $pollTitle,
                 a.latestVoteType = $voteType,
                 a.latestSourcePath = $sourcePath,
+                a.currentIntensity = $currentIntensity,
+                a.intensityMass = $intensityMass,
+                a.lastIntensityDecayAt = $evidenceTimestamp,
+                a.lastIntensityUpdatedAt = $now,
+                a.intensityBand = $intensityBand,
+                a.baseIntensityContribution = $baseIntensityContribution,
+                a.assertionGroupKey = $assertionGroupKey,
                 a.lastUpdatedAt = $now
             `,
             {
@@ -168,9 +274,34 @@ export async function writeVoteToGraph(args: {
               pollTitle: vote.poll.title,
               voteType: vote.type,
               sourcePath: artifact.sourcePath,
-              now: new Date().toISOString(),
+              currentIntensity: nextIntensityState.ownIntensity,
+              intensityMass: nextIntensityState.ownMass,
+              intensityBand,
+              baseIntensityContribution,
+              assertionGroupKey,
+              now,
             },
           );
+
+          if (oppositeAssertionSignature) {
+            await tx.run(
+              `
+              MATCH (opposite:Assertion {assertionSignature: $assertionSignature})
+              SET opposite.currentIntensity = $currentIntensity,
+                  opposite.intensityMass = $intensityMass,
+                  opposite.lastIntensityDecayAt = $evidenceTimestamp,
+                  opposite.lastIntensityUpdatedAt = $now,
+                  opposite.lastUpdatedAt = $now
+              `,
+              {
+                assertionSignature: oppositeAssertionSignature,
+                currentIntensity: nextIntensityState.oppositeIntensity,
+                intensityMass: nextIntensityState.oppositeMass,
+                evidenceTimestamp,
+                now,
+              },
+            );
+          }
         }
 
         if (assertion.aboutTopic) {

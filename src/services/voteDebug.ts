@@ -129,10 +129,13 @@ export function logQdrantPlan(args: {
     },
     assertions: (args.record.resolvedAssertions ?? []).map((assertion) => ({
       assertionSignature: assertion.assertionSignature,
+      assertionGroupKey: assertion.assertionGroupKey,
       relationId: assertion.relationId,
       relationLabel: assertion.relationLabel,
       relationFamily: assertion.relationFamily,
       polarity: assertion.polarity,
+      intensityBand: assertion.intensityBand,
+      baseIntensityContribution: assertion.baseIntensityContribution,
       targetSubjectId: assertion.target.canonicalId,
       aboutTopicId: assertion.aboutTopic?.canonicalId ?? null,
     })),
@@ -171,6 +174,9 @@ function describeAssertion(assertion: ResolvedAssertion): unknown {
     },
     target: describeSubject(assertion.target),
     aboutTopic: describeSubject(assertion.aboutTopic),
+    assertionGroupKey: assertion.assertionGroupKey,
+    intensityBand: assertion.intensityBand,
+    baseIntensityContribution: assertion.baseIntensityContribution,
     confidence: assertion.confidence,
     notes: assertion.notes,
   };

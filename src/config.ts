@@ -32,6 +32,10 @@ export const config = {
     progressCollectionName: process.env.QDRANT_PROGRESS_COLLECTION ?? "import_progress",
     matchThreshold: Number(process.env.QDRANT_MATCH_SCORE_THRESHOLD ?? "0.92"),
   },
+  intensity: {
+    halfLifeDays: Number(process.env.INTENSITY_HALF_LIFE_DAYS ?? "180"),
+    oppositeSuppression: Number(process.env.INTENSITY_OPPOSITE_SUPPRESSION ?? "0.70"),
+  },
   datasetMode: parseDatasetMode(requireEnv("DATASET_MODE")),
   votesJsonPath: requireEnv("VOTES_JSON_PATH"),
   processTillFirstNVotes: parseProcessTillFirstNVotes(process.env.PROCESS_TILL_FIRST_N_VOTES),

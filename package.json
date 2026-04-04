@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "bun run src/index.ts",
     "start": "bun run src/index.ts",
+    "query": "bun run src/scripts/query.ts",
     "generate:benchmark": "bun run src/scripts/generatePoliticalBenchmark.ts",
     "reset": "bun run src/scripts/reset.ts",
     "test": "bun test"

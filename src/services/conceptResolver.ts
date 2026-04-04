@@ -3,6 +3,7 @@ import { config } from "../config";
 import { qdrantClient } from "../db/qdrant";
 import type {
   InferredSemantics,
+  IntensityBand,
   PollSemanticTemplate,
   RawVote,
   RelationPolarity,
@@ -10,6 +11,8 @@ import type {
   ResolvedSubject,
   SubjectKind,
 } from "../types";
+import { hasHighLexicalOverlap, hasNameLikeOverlap } from "../utils/conceptQuality";
+import { intensityBandToContribution } from "../utils/intensity";
 import { textToVector } from "../utils/embedding";
 import { normalizeText, slugify } from "../utils/text";
 
@@ -21,6 +24,13 @@ type CanonicalRelationSpec = {
   relationLabel: string;
   relationFamily: CanonicalRelationFamily;
   polarity: RelationPolarity;
+};
+
+const VECTOR_THRESHOLD_BY_KIND: Record<SubjectKind, number> = {
+  topic: 0.97,
+  position: 0.97,
+  entity: 0.95,
+  ideology: 0.97,
 };
 
 function compact<T>(values: Array<T | null | undefined | false>): T[] {
@@ -40,6 +50,40 @@ function clampConfidence(value: number | undefined): number {
 
 function registryCollectionName(): string {
   return config.qdrant.registryCollectionName;
+}
+
+function vectorThresholdForKind(kind: SubjectKind): number {
+  return Math.max(config.qdrant.matchThreshold, VECTOR_THRESHOLD_BY_KIND[kind]);
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+export function acceptsConservativeVectorMatch(args: {
+  kind: SubjectKind;
+  score: number;
+  inputLabel: string;
+  inputAliases?: string[];
+  candidateLabel: string;
+  candidateAliases?: string[];
+}): boolean {
+  if (args.score < vectorThresholdForKind(args.kind)) {
+    return false;
+  }
+
+  const inputValues = dedupeStrings([args.inputLabel, ...(args.inputAliases ?? [])]);
+  const candidateValues = dedupeStrings([args.candidateLabel, ...(args.candidateAliases ?? [])]);
+
+  if (args.kind === "entity") {
+    return inputValues.some((inputValue) =>
+      candidateValues.some((candidateValue) => hasNameLikeOverlap(inputValue, candidateValue)),
+    );
+  }
+
+  return inputValues.some((inputValue) =>
+    candidateValues.some((candidateValue) => hasHighLexicalOverlap(inputValue, candidateValue, 0.5)),
+  );
 }
 
 export function buildQdrantRegistryPointId(canonicalId: string): string {
@@ -64,6 +108,16 @@ export function buildAssertionSignature(args: {
 }): string {
   const signatureSource = [args.userId, args.relationId, args.targetSubjectId, args.aboutTopicId ?? ""].join("::");
   return `assertion_${createHash("sha256").update(signatureSource).digest("hex").slice(0, 32)}`;
+}
+
+export function buildAssertionGroupKey(args: {
+  userId: string;
+  relationFamily: string;
+  targetSubjectId: string;
+  aboutTopicId?: string | null;
+}): string {
+  const groupSource = [args.userId, args.relationFamily, args.targetSubjectId, args.aboutTopicId ?? ""].join("::");
+  return `assertion_group_${createHash("sha256").update(groupSource).digest("hex").slice(0, 32)}`;
 }
 
 function buildSubjectCanonicalId(args: SubjectResolverInput): string {
@@ -224,7 +278,7 @@ async function resolveSubject(input: SubjectResolverInput): Promise<ResolvedSubj
           { key: "subjectKind", match: { value: input.kind } },
           input.topicCanonicalId ? { key: "topicCanonicalId", match: { value: input.topicCanonicalId } } : null,
         ]),
-        should: normalizedAliases.map((alias) => ({ key: "normalizedLabel", match: { value: alias } })),
+        should: normalizedAliases.map((alias) => ({ key: "aliasesNormalized", match: { value: alias } })),
       },
       with_payload: true,
       with_vector: false,
@@ -257,13 +311,24 @@ async function resolveSubject(input: SubjectResolverInput): Promise<ResolvedSubj
   ]);
   const vectorHits = await qdrantClient.search(registryCollectionName(), {
     vector,
-    limit: 1,
+    limit: 3,
     with_payload: true,
     filter: { must: vectorMust },
   });
 
-  if (vectorHits.length > 0 && Number(vectorHits[0].score) >= config.qdrant.matchThreshold) {
-    const point = vectorHits[0];
+  const acceptedVectorHit = vectorHits.find((point) =>
+    acceptsConservativeVectorMatch({
+      kind: input.kind,
+      score: Number(point.score),
+      inputLabel: input.label,
+      inputAliases: input.aliases,
+      candidateLabel: String(point.payload?.canonicalLabel ?? input.label),
+      candidateAliases: toStringArray(point.payload?.aliases),
+    }),
+  );
+
+  if (acceptedVectorHit) {
+    const point = acceptedVectorHit;
 
     return {
       entryKind: "subject",
@@ -312,6 +377,23 @@ async function resolveSubject(input: SubjectResolverInput): Promise<ResolvedSubj
 
 function buildSubjectLookupKey(kind: SubjectKind, label: string, topicCanonicalId?: string): string {
   return [kind, normalizeText(label), topicCanonicalId ?? ""].join("::");
+}
+
+function normalizeIntensityBand(value: unknown): IntensityBand {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "weak" || normalized === "medium" || normalized === "strong") {
+    return normalized;
+  }
+
+  return "medium";
+}
+
+function normalizeBaseIntensityContribution(value: unknown, band: IntensityBand): number {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return value;
+  }
+
+  return intensityBandToContribution(band);
 }
 
 export async function resolveSemanticRegistry(args: {
@@ -375,6 +457,17 @@ export async function resolveSemanticRegistry(args: {
       polarity: relation.polarity,
       target,
       aboutTopic,
+      assertionGroupKey: buildAssertionGroupKey({
+        userId: args.vote.voter.externalAccountId,
+        relationFamily: relation.relationFamily,
+        targetSubjectId: target.canonicalId,
+        aboutTopicId: aboutTopic?.canonicalId ?? null,
+      }),
+      intensityBand: normalizeIntensityBand(assertion.intensityBand),
+      baseIntensityContribution: normalizeBaseIntensityContribution(
+        assertion.baseIntensityContribution,
+        normalizeIntensityBand(assertion.intensityBand),
+      ),
       confidence: clampConfidence(assertion.confidence),
       notes: dedupeStrings(assertion.notes),
     });
