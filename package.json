@@ -1,0 +1,23 @@
+{
+  "name": "bun-vote-graph-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "start": "bun run src/index.ts",
+    "generate:benchmark": "bun run src/scripts/generatePoliticalBenchmark.ts",
+    "reset": "bun run src/scripts/reset.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "openai": "^6.4.0",
+    "@qdrant/js-client-rest": "^1.15.1",
+    "dotenv": "^16.6.1",
+    "neo4j-driver": "^6.0.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}
