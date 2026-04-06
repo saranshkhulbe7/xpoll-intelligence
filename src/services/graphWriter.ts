@@ -5,6 +5,7 @@ import type { RawVote, RelationPolarity, ResolvedSubject, ResolvedVoteArtifact, 
 import { getSelectedOption } from "./contextBuilder";
 import { markNeo4jDone } from "./importLedger";
 import { intensityBandToContribution, updateIntensityState } from "../utils/intensity";
+import { buildUserDimensions, type UserDimensionNode } from "./userDimensions";
 
 function subjectLabel(kind: SubjectKind): string {
   switch (kind) {
@@ -76,6 +77,150 @@ async function ensureSubjectNode(tx: any, subject: ResolvedSubject): Promise<voi
   );
 }
 
+async function ensureUserDimensionNode(tx: any, dimension: UserDimensionNode): Promise<void> {
+  const label = dimension.kind.charAt(0).toUpperCase() + dimension.kind.slice(1);
+
+  await tx.run(
+    `
+    MERGE (n:${label} {canonicalId: $canonicalId})
+    SET n.name = $name,
+        n.normalizedName = $normalizedName
+    `,
+    {
+      canonicalId: dimension.canonicalId,
+      name: dimension.name,
+      normalizedName: dimension.normalizedName,
+    },
+  );
+}
+
+async function syncUserDimensions(tx: any, vote: RawVote): Promise<void> {
+  const dimensions = buildUserDimensions(vote.voter);
+
+  await tx.run(
+    `
+    MATCH (u:User {externalAccountId: $externalAccountId})
+    OPTIONAL MATCH (u)-[r:HAS_GENDER|IN_CITY|IN_STATE|IN_COUNTRY]->()
+    DELETE r
+    `,
+    {
+      externalAccountId: vote.voter.externalAccountId,
+    },
+  );
+
+  if (dimensions.country) {
+    await ensureUserDimensionNode(tx, dimensions.country);
+  }
+
+  if (dimensions.state) {
+    await ensureUserDimensionNode(tx, dimensions.state);
+  }
+
+  if (dimensions.city) {
+    await ensureUserDimensionNode(tx, dimensions.city);
+  }
+
+  if (dimensions.gender) {
+    await ensureUserDimensionNode(tx, dimensions.gender);
+  }
+
+  if (dimensions.country && dimensions.state) {
+    await tx.run(
+      `
+      MATCH (state:State {canonicalId: $stateId})
+      MATCH (country:Country {canonicalId: $countryId})
+      MERGE (state)-[:IN_COUNTRY]->(country)
+      `,
+      {
+        stateId: dimensions.state.canonicalId,
+        countryId: dimensions.country.canonicalId,
+      },
+    );
+  }
+
+  if (dimensions.city && dimensions.state) {
+    await tx.run(
+      `
+      MATCH (city:City {canonicalId: $cityId})
+      MATCH (state:State {canonicalId: $stateId})
+      MERGE (city)-[:IN_STATE]->(state)
+      `,
+      {
+        cityId: dimensions.city.canonicalId,
+        stateId: dimensions.state.canonicalId,
+      },
+    );
+  } else if (dimensions.city && dimensions.country) {
+    await tx.run(
+      `
+      MATCH (city:City {canonicalId: $cityId})
+      MATCH (country:Country {canonicalId: $countryId})
+      MERGE (city)-[:IN_COUNTRY]->(country)
+      `,
+      {
+        cityId: dimensions.city.canonicalId,
+        countryId: dimensions.country.canonicalId,
+      },
+    );
+  }
+
+  if (dimensions.country) {
+    await tx.run(
+      `
+      MATCH (u:User {externalAccountId: $externalAccountId})
+      MATCH (country:Country {canonicalId: $countryId})
+      MERGE (u)-[:IN_COUNTRY]->(country)
+      `,
+      {
+        externalAccountId: vote.voter.externalAccountId,
+        countryId: dimensions.country.canonicalId,
+      },
+    );
+  }
+
+  if (dimensions.state) {
+    await tx.run(
+      `
+      MATCH (u:User {externalAccountId: $externalAccountId})
+      MATCH (state:State {canonicalId: $stateId})
+      MERGE (u)-[:IN_STATE]->(state)
+      `,
+      {
+        externalAccountId: vote.voter.externalAccountId,
+        stateId: dimensions.state.canonicalId,
+      },
+    );
+  }
+
+  if (dimensions.city) {
+    await tx.run(
+      `
+      MATCH (u:User {externalAccountId: $externalAccountId})
+      MATCH (city:City {canonicalId: $cityId})
+      MERGE (u)-[:IN_CITY]->(city)
+      `,
+      {
+        externalAccountId: vote.voter.externalAccountId,
+        cityId: dimensions.city.canonicalId,
+      },
+    );
+  }
+
+  if (dimensions.gender) {
+    await tx.run(
+      `
+      MATCH (u:User {externalAccountId: $externalAccountId})
+      MATCH (gender:Gender {canonicalId: $genderId})
+      MERGE (u)-[:HAS_GENDER]->(gender)
+      `,
+      {
+        externalAccountId: vote.voter.externalAccountId,
+        genderId: dimensions.gender.canonicalId,
+      },
+    );
+  }
+}
+
 function getAssertionEvidenceTimestamp(vote: RawVote): string {
   return vote.timestamps?.respondedAt ?? vote.timestamps?.seenAt ?? new Date().toISOString();
 }
@@ -128,6 +273,8 @@ export async function writeVoteToGraph(args: {
           country: vote.voter.location?.country ?? null,
         },
       );
+
+      await syncUserDimensions(tx, vote);
 
       for (const subject of artifact.resolvedSubjects ?? []) {
         await ensureSubjectNode(tx, subject);

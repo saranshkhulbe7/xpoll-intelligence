@@ -12,8 +12,10 @@ import { buildPollFingerprint, buildPollKey } from "./contextBuilder";
 import { intensityBandToContribution } from "../utils/intensity";
 import {
   extractLikelyEntityName,
+  filterEntityAliases,
   hasHighLexicalOverlap,
   isContextualEntityLabel,
+  isValidEntityAlias,
   stripOptionLeadIn,
 } from "../utils/conceptQuality";
 import { normalizeText } from "../utils/text";
@@ -175,6 +177,8 @@ function buildOptionAliases(args: {
     if (entityName) {
       derivedAliases.push(entityName);
     }
+
+    return filterEntityAliases(args.canonicalTargetLabel, [...args.aliases, ...derivedAliases]);
   }
 
   return normalizeAliases([...args.aliases, ...derivedAliases, args.canonicalTargetLabel]);
@@ -300,7 +304,7 @@ export function promoteSafeTemplateAliases(args: {
       return option;
     }
 
-    const entityAlias = option.aliases?.find((alias) => !isContextualEntityLabel(alias));
+    const entityAlias = option.aliases?.find((alias) => !isContextualEntityLabel(alias) && isValidEntityAlias(alias, option.canonicalTargetLabel));
     if (!entityAlias || normalizeText(entityAlias) === normalizeText(option.canonicalTargetLabel)) {
       return option;
     }

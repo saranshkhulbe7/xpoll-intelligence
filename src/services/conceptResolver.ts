@@ -60,6 +60,65 @@ function toStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String) : [];
 }
 
+export type ConservativeVectorMatchInspection = {
+  accepted: boolean;
+  rejectionReason: "score_below_threshold" | "lexical_overlap_below_threshold" | null;
+  lexicalOverlap: number;
+  threshold: number;
+};
+
+export function inspectConservativeVectorMatch(args: {
+  kind: SubjectKind;
+  score: number;
+  inputLabel: string;
+  inputAliases?: string[];
+  candidateLabel: string;
+  candidateAliases?: string[];
+}): ConservativeVectorMatchInspection {
+  const threshold = vectorThresholdForKind(args.kind);
+  if (args.score < threshold) {
+    return {
+      accepted: false,
+      rejectionReason: "score_below_threshold",
+      lexicalOverlap: 0,
+      threshold,
+    };
+  }
+
+  const inputValues = dedupeStrings([args.inputLabel, ...(args.inputAliases ?? [])]);
+  const candidateValues = dedupeStrings([args.candidateLabel, ...(args.candidateAliases ?? [])]);
+
+  if (args.kind === "entity") {
+    const accepted = inputValues.some((inputValue) =>
+      candidateValues.some((candidateValue) => hasNameLikeOverlap(inputValue, candidateValue)),
+    );
+    return {
+      accepted,
+      rejectionReason: accepted ? null : "lexical_overlap_below_threshold",
+      lexicalOverlap: accepted ? 1 : 0,
+      threshold,
+    };
+  }
+
+  let lexicalOverlap = 0;
+  const accepted = inputValues.some((inputValue) =>
+    candidateValues.some((candidateValue) => {
+      const overlap = hasHighLexicalOverlap(inputValue, candidateValue, 0.5);
+      if (overlap) {
+        lexicalOverlap = Math.max(lexicalOverlap, 0.5);
+      }
+      return overlap;
+    }),
+  );
+
+  return {
+    accepted,
+    rejectionReason: accepted ? null : "lexical_overlap_below_threshold",
+    lexicalOverlap,
+    threshold,
+  };
+}
+
 export function acceptsConservativeVectorMatch(args: {
   kind: SubjectKind;
   score: number;
@@ -68,22 +127,7 @@ export function acceptsConservativeVectorMatch(args: {
   candidateLabel: string;
   candidateAliases?: string[];
 }): boolean {
-  if (args.score < vectorThresholdForKind(args.kind)) {
-    return false;
-  }
-
-  const inputValues = dedupeStrings([args.inputLabel, ...(args.inputAliases ?? [])]);
-  const candidateValues = dedupeStrings([args.candidateLabel, ...(args.candidateAliases ?? [])]);
-
-  if (args.kind === "entity") {
-    return inputValues.some((inputValue) =>
-      candidateValues.some((candidateValue) => hasNameLikeOverlap(inputValue, candidateValue)),
-    );
-  }
-
-  return inputValues.some((inputValue) =>
-    candidateValues.some((candidateValue) => hasHighLexicalOverlap(inputValue, candidateValue, 0.5)),
-  );
+  return inspectConservativeVectorMatch(args).accepted;
 }
 
 export function buildQdrantRegistryPointId(canonicalId: string): string {

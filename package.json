@@ -7,6 +7,7 @@
     "dev": "bun run src/index.ts",
     "start": "bun run src/index.ts",
     "query": "bun run src/scripts/query.ts",
+    "copy:neo4j:aura": "node src/scripts/copyNeo4jToAura.ts",
     "generate:benchmark": "bun run src/scripts/generatePoliticalBenchmark.ts",
     "reset": "bun run src/scripts/reset.ts",
     "test": "bun test"

@@ -39,6 +39,12 @@ const ENTITY_CONTEXT_KEYWORDS = new Set([
   "views",
 ]);
 
+const ENTITY_ALIAS_DISALLOWED_PREFIXES = [
+  /^(has|have|had|did|does|do|should|would|could|will|can|is|are|was|were)\b/i,
+  /^(he|she|they|his|her|their)\b/i,
+  /^(yes|no)\b[:,]?\s*/i,
+];
+
 export function meaningfulTokens(value: string): string[] {
   return normalizeText(value)
     .split(" ")
@@ -113,4 +119,26 @@ export function stripOptionLeadIn(value: string): string {
     .replace(/\b(definitely|absolutely|clearly|really|strongly)\b/gi, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+export function isValidEntityAlias(alias: string, canonicalEntityLabel: string): boolean {
+  const trimmed = alias.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (trimmed.includes("?")) {
+    return false;
+  }
+
+  if (ENTITY_ALIAS_DISALLOWED_PREFIXES.some((pattern) => pattern.test(trimmed))) {
+    return false;
+  }
+
+  return hasNameLikeOverlap(trimmed, canonicalEntityLabel);
+}
+
+export function filterEntityAliases(canonicalEntityLabel: string, aliases: string[]): string[] {
+  const deduped = Array.from(new Set([canonicalEntityLabel, ...aliases].map((value) => value.trim()).filter(Boolean)));
+  return deduped.filter((alias) => isValidEntityAlias(alias, canonicalEntityLabel));
 }

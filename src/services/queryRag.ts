@@ -4,8 +4,10 @@ import { neo4jDriver } from "../db/neo4j";
 import { qdrantClient } from "../db/qdrant";
 import { openaiClient } from "../openai";
 import type { RelationPolarity, SubjectKind } from "../types";
-import { acceptsConservativeVectorMatch } from "./conceptResolver";
+import { acceptsConservativeVectorMatch, inspectConservativeVectorMatch } from "./conceptResolver";
+import { buildQueryStorageContract } from "./queryPromptContext";
 import { textToVector } from "../utils/embedding";
+import { lexicalOverlapRatio, meaningfulTokens } from "../utils/conceptQuality";
 import { normalizeText } from "../utils/text";
 
 export type QueryIntentType =
@@ -16,18 +18,29 @@ export type QueryIntentType =
   | "compare_users_on_concept";
 
 export type QueryRelationFamily = "support" | "preference" | "sentiment" | "uncertainty";
-export type QuerySubjectMatchType = "exact" | "alias" | "vector";
+export type QuerySubjectMatchType = "exact" | "alias" | "vector" | "graph_fallback";
 
 export type QueryIntent = {
   supported: boolean;
   intentType: QueryIntentType;
   userRefs: string[];
   conceptRefs: string[];
+  cohorts: QueryCohort[];
   relationFamilies: QueryRelationFamily[];
   polarityFilter?: RelationPolarity;
   resultLimit: number;
   needsEvidence: boolean;
   unsupportedReason?: string;
+};
+
+export type ParseQueryIntentOptions = {
+  skillGuidance?: string;
+};
+
+export type QueryCohort = {
+  label: string;
+  locationRefs: string[];
+  genderRefs: string[];
 };
 
 export type SubjectSearchHit = {
@@ -97,13 +110,66 @@ export type RetrievedAssertion = {
 export type QueryResultCluster = {
   queryRef: string | null;
   matchedConcept: SubjectSearchHit | null;
+  cohort: QueryCohort | null;
+  metrics: QueryClusterMetrics | null;
   assertions: RetrievedAssertion[];
+};
+
+export type QueryClusterMetrics = {
+  totalUsers: number;
+  matchedUsers: number;
+  positiveUsers: number;
+  negativeUsers: number;
+  neutralUsers: number;
+  positivePct: number;
+  negativePct: number;
+  neutralPct: number;
+  averageIntensity: number | null;
+};
+
+export type VectorSubjectCandidateInspection = SubjectSearchHit & {
+  accepted: boolean;
+  rejectionReason: "score_below_threshold" | "lexical_overlap_below_threshold" | null;
+  threshold: number;
+  semanticCoverage: number;
+  lexicalOverlap: number;
+};
+
+export type GraphConceptCandidate = {
+  canonicalId: string;
+  label: string;
+  kind: SubjectKind;
+  topicCanonicalId: string | null;
+  assertionCount: number;
+  lexicalOverlap: number;
+  semanticCoverage: number;
+  accepted: boolean;
+};
+
+export type ConceptResolutionRootCause =
+  | "missing_from_registry"
+  | "different_label_or_alias_gap"
+  | "vector_too_conservative"
+  | "no_candidate_anywhere";
+
+export type ConceptResolutionInspection = {
+  query: string;
+  normalizedQuery: string;
+  allowedKinds: SubjectKind[];
+  exactHits: SubjectSearchHit[];
+  aliasHits: SubjectSearchHit[];
+  vectorAcceptedHits: SubjectSearchHit[];
+  vectorCandidates: VectorSubjectCandidateInspection[];
+  graphCandidates: GraphConceptCandidate[];
+  graphFallbackHits: SubjectSearchHit[];
+  rootCause: ConceptResolutionRootCause | null;
 };
 
 export type GroundedQueryAnswer = {
   question: string;
   intent: QueryIntent;
   matchedUsers: ResolvedQueryUser[];
+  cohorts: QueryCohort[];
   matchedConcepts: Array<{
     query: string;
     hits: SubjectSearchHit[];
@@ -118,6 +184,11 @@ type IntentModelResponse = {
   intentType?: string;
   userRefs?: string[];
   conceptRefs?: string[];
+  cohorts?: Array<{
+    label?: string;
+    locationRefs?: string[];
+    genderRefs?: string[];
+  }>;
   relationFamilies?: string[];
   polarityFilter?: string | null;
   resultLimit?: number;
@@ -160,6 +231,25 @@ const QUERY_INTENT_SCHEMA = {
       type: "array",
       items: { type: "string" },
     },
+    cohorts: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          label: { type: "string" },
+          locationRefs: {
+            type: "array",
+            items: { type: "string" },
+          },
+          genderRefs: {
+            type: "array",
+            items: { type: "string" },
+          },
+        },
+        required: ["label", "locationRefs", "genderRefs"],
+      },
+    },
     relationFamilies: {
       type: "array",
       items: { type: "string" },
@@ -178,6 +268,7 @@ const QUERY_INTENT_SCHEMA = {
     "intentType",
     "userRefs",
     "conceptRefs",
+    "cohorts",
     "relationFamilies",
     "polarityFilter",
     "resultLimit",
@@ -216,6 +307,73 @@ function clampResultLimit(value: unknown, fallback = DEFAULT_RESULT_LIMIT): numb
 
 function dedupeStrings(values: string[]): string[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+const QUERY_TOKEN_SYNONYMS: Record<string, string[]> = {
+  renewable: ["renewables", "clean", "green"],
+  renewables: ["renewable", "clean", "green"],
+  clean: ["renewable", "renewables", "green"],
+  green: ["renewable", "renewables", "clean"],
+  energy: ["power"],
+  power: ["energy"],
+};
+
+function semanticCoverage(query: string, candidate: string): number {
+  const queryTokens = Array.from(new Set(meaningfulTokens(query)));
+  const candidateTokens = new Set(meaningfulTokens(candidate));
+
+  if (queryTokens.length === 0 || candidateTokens.size === 0) {
+    return 0;
+  }
+
+  let matchedQueryTokens = 0;
+  for (const queryToken of queryTokens) {
+    const variants = [queryToken, ...(QUERY_TOKEN_SYNONYMS[queryToken] ?? [])];
+    if (variants.some((variant) => candidateTokens.has(variant))) {
+      matchedQueryTokens += 1;
+    }
+  }
+
+  return matchedQueryTokens / queryTokens.length;
+}
+
+function labelMatchesQueryExactly(label: string, query: string): boolean {
+  return normalizeText(label) === normalizeText(query);
+}
+
+function normalizeCohorts(value: unknown): QueryCohort[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== "object") {
+        return null;
+      }
+
+      const record = entry as Record<string, unknown>;
+      const label = typeof record.label === "string" && record.label.trim().length > 0
+        ? record.label.trim()
+        : dedupeStrings([
+          ...toStringArray(record.locationRefs),
+          ...toStringArray(record.genderRefs),
+        ]).join(" ");
+
+      const locationRefs = dedupeStrings(toStringArray(record.locationRefs));
+      const genderRefs = dedupeStrings(toStringArray(record.genderRefs));
+
+      if (!label || (locationRefs.length === 0 && genderRefs.length === 0)) {
+        return null;
+      }
+
+      return {
+        label,
+        locationRefs,
+        genderRefs,
+      };
+    })
+    .filter((entry): entry is QueryCohort => Boolean(entry));
 }
 
 function normalizeRelationFamilies(values: unknown): QueryRelationFamily[] {
@@ -271,8 +429,58 @@ function toOptionalString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function sanitizeCohortPhrase(value: string): string {
+  return value.trim().replace(/\s+users?$/i, "").trim();
+}
+
 function heuristicIntentFallback(question: string, limit: number): QueryIntent {
   const normalizedQuestion = question.trim();
+  const percentageMatch = normalizedQuestion.match(/^what percentage of\s+(.+?)\s+are\s+(positive|negative|neutral)\s+toward\s+(.+?)(?:\?|$)/i);
+  if (percentageMatch) {
+    const cohortPhrase = sanitizeCohortPhrase(percentageMatch[1] ?? "cohort");
+    const isGenderOnly = /^(male|female|nonbinary)$/i.test(cohortPhrase);
+    return {
+      supported: true,
+      intentType: "concept_cohort_summary",
+      userRefs: [],
+      conceptRefs: [percentageMatch[3] ?? ""].filter(Boolean),
+      cohorts: [{
+        label: percentageMatch[1] ?? "cohort",
+        locationRefs: isGenderOnly ? [] : [cohortPhrase].filter(Boolean),
+        genderRefs: isGenderOnly ? [cohortPhrase] : [],
+      }],
+      relationFamilies: ["sentiment"],
+      polarityFilter: normalizePolarityFilter(percentageMatch[2]),
+      resultLimit: clampResultLimit(limit),
+      needsEvidence: true,
+    };
+  }
+
+  const compareCohortsMatch = normalizedQuestion.match(/^compare\s+(.+?)\s+users?\s+on\s+(.+?)(?:\?|$)/i);
+  if (compareCohortsMatch) {
+    const rawCohorts = (compareCohortsMatch[1] ?? "")
+      .split(/\s*,\s*|\s+and\s+/i)
+      .map((value) => sanitizeCohortPhrase(value))
+      .filter(Boolean);
+
+    if (rawCohorts.length >= 2) {
+      return {
+        supported: true,
+        intentType: "concept_cohort_summary",
+        userRefs: [],
+        conceptRefs: [compareCohortsMatch[2] ?? ""].filter(Boolean),
+      cohorts: rawCohorts.map((value) => ({
+        label: `${value} users`,
+        locationRefs: /^(male|female|nonbinary)$/i.test(value) ? [] : [value],
+        genderRefs: /^(male|female|nonbinary)$/i.test(value) ? [value] : [],
+      })),
+        relationFamilies: [],
+        resultLimit: clampResultLimit(limit),
+        needsEvidence: true,
+      };
+    }
+  }
+
   const compareMatch = normalizedQuestion.match(/^compare\s+(.+?)\s+and\s+(.+?)\s+on\s+(.+?)(?:\?|$)/i);
   if (compareMatch) {
     return {
@@ -280,6 +488,7 @@ function heuristicIntentFallback(question: string, limit: number): QueryIntent {
       intentType: "compare_users_on_concept",
       userRefs: [compareMatch[1] ?? "", compareMatch[2] ?? ""].filter(Boolean),
       conceptRefs: [compareMatch[3] ?? ""].filter(Boolean),
+      cohorts: [],
       relationFamilies: [],
       resultLimit: clampResultLimit(limit),
       needsEvidence: true,
@@ -293,6 +502,7 @@ function heuristicIntentFallback(question: string, limit: number): QueryIntent {
       intentType: "user_summary",
       userRefs: [strongestViewsMatch[1] ?? ""].filter(Boolean),
       conceptRefs: [],
+      cohorts: [],
       relationFamilies: [],
       resultLimit: clampResultLimit(limit),
       needsEvidence: true,
@@ -306,6 +516,7 @@ function heuristicIntentFallback(question: string, limit: number): QueryIntent {
       intentType: "user_entity_sentiment",
       userRefs: [howFeelMatch[1] ?? ""].filter(Boolean),
       conceptRefs: [howFeelMatch[2] ?? ""].filter(Boolean),
+      cohorts: [],
       relationFamilies: ["sentiment"],
       resultLimit: clampResultLimit(limit),
       needsEvidence: true,
@@ -319,8 +530,28 @@ function heuristicIntentFallback(question: string, limit: number): QueryIntent {
       intentType: "concept_cohort_summary",
       userRefs: [],
       conceptRefs: [whoTowardMatch[2] ?? ""].filter(Boolean),
+      cohorts: [],
       relationFamilies: ["sentiment"],
       polarityFilter: normalizePolarityFilter(whoTowardMatch[1]),
+      resultLimit: clampResultLimit(limit),
+      needsEvidence: true,
+    };
+  }
+
+  const usersInLocationMatch = normalizedQuestion.match(/^what do users?\s+in\s+(.+?)\s+think about\s+(.+?)(?:\?|$)/i);
+  if (usersInLocationMatch) {
+    const locationPhrase = sanitizeCohortPhrase(usersInLocationMatch[1] ?? "");
+    return {
+      supported: true,
+      intentType: "concept_cohort_summary",
+      userRefs: [],
+      conceptRefs: [usersInLocationMatch[2] ?? ""].filter(Boolean),
+      cohorts: [{
+        label: `${locationPhrase} users`,
+        locationRefs: [locationPhrase].filter(Boolean),
+        genderRefs: [],
+      }],
+      relationFamilies: [],
       resultLimit: clampResultLimit(limit),
       needsEvidence: true,
     };
@@ -333,6 +564,7 @@ function heuristicIntentFallback(question: string, limit: number): QueryIntent {
       intentType: "user_concept_summary",
       userRefs: [userConceptMatch[1] ?? ""].filter(Boolean),
       conceptRefs: [userConceptMatch[2] ?? ""].filter(Boolean),
+      cohorts: [],
       relationFamilies: [],
       resultLimit: clampResultLimit(limit),
       needsEvidence: true,
@@ -344,6 +576,7 @@ function heuristicIntentFallback(question: string, limit: number): QueryIntent {
     intentType: "user_summary",
     userRefs: [],
     conceptRefs: [],
+    cohorts: [],
     relationFamilies: [],
     resultLimit: clampResultLimit(limit),
     needsEvidence: true,
@@ -352,8 +585,13 @@ function heuristicIntentFallback(question: string, limit: number): QueryIntent {
   };
 }
 
-export async function parseQueryIntent(question: string, limit = DEFAULT_RESULT_LIMIT): Promise<QueryIntent> {
+export async function parseQueryIntent(
+  question: string,
+  limit = DEFAULT_RESULT_LIMIT,
+  options?: ParseQueryIntentOptions,
+): Promise<QueryIntent> {
   const usesRealtimeModel = REALTIME_MODEL_PATTERN.test(config.openai.model);
+  const storageContract = buildQueryStorageContract(2500);
 
   try {
     const response = await openaiClient.responses.create({
@@ -371,15 +609,23 @@ export async function parseQueryIntent(question: string, limit = DEFAULT_RESULT_
                 "Set supported=false when the question asks for causality, prediction, policy design, hidden motivations, or anything outside retrieved graph evidence.",
                 "user_summary = strongest current assertions for one user.",
                 "user_concept_summary = one user's assertions about one concept or issue area.",
-                "concept_cohort_summary = who holds a stance on a concept or entity.",
+                "concept_cohort_summary = what one or more cohorts think about one concept or entity, including cohort comparisons and percentage questions.",
                 "user_entity_sentiment = one user's sentiment toward a person or organization.",
                 "compare_users_on_concept = compare two named users on one concept.",
                 "Extract userRefs exactly as named in the question when present.",
                 "Extract conceptRefs as compact phrases that can be used to search the subject registry.",
+                "Use cohorts to represent location or gender groups. Each cohort must have a label plus locationRefs and genderRefs arrays.",
+                "locationRefs are raw place phrases like India, Texas, Mumbai, USA, or California. Do not try to classify them into city/state/country yourself.",
+                "genderRefs are gender phrases like male, female, or nonbinary.",
+                "For questions like 'What do users in India think about immigration?' create one cohort for India users.",
+                "For questions like 'Compare male and female users on healthcare' create two cohorts, one for male and one for female.",
+                "For questions like 'Compare India, USA, and UK users on healthcare' create one cohort per location.",
                 "Use relationFamilies only from: support, preference, sentiment, uncertainty.",
                 "Use polarityFilter only from: positive, negative, neutral, or null.",
                 "Keep resultLimit small and practical for a terminal response.",
                 "Set needsEvidence=true unless the question explicitly asks for a terse answer only.",
+                storageContract,
+                options?.skillGuidance ? `Use this reasoning guidance while classifying the query:\n${options.skillGuidance}` : "",
               ].join(" "),
             },
           ],
@@ -422,6 +668,7 @@ export async function parseQueryIntent(question: string, limit = DEFAULT_RESULT_
       intentType: intentType ?? "user_summary",
       userRefs: dedupeStrings(toStringArray(parsed.userRefs)),
       conceptRefs: dedupeStrings(toStringArray(parsed.conceptRefs)),
+      cohorts: normalizeCohorts(parsed.cohorts),
       relationFamilies: normalizeRelationFamilies(parsed.relationFamilies),
       polarityFilter: normalizePolarityFilter(parsed.polarityFilter),
       resultLimit: clampResultLimit(parsed.resultLimit, limit),
@@ -431,7 +678,7 @@ export async function parseQueryIntent(question: string, limit = DEFAULT_RESULT_
           ? undefined
           : (typeof parsed.unsupportedReason === "string" && parsed.unsupportedReason.trim().length > 0
               ? parsed.unsupportedReason.trim()
-              : "This question is not reliably supported by the current graph query capabilities."),
+      : "This question is not reliably supported by the current graph query capabilities."),
     };
   } catch {
     return heuristicIntentFallback(question, limit);
@@ -464,8 +711,11 @@ function subjectHitFromPayload(args: {
   };
 }
 
-export async function searchRegistrySubjectsReadOnly(args: {
+type RegistrySearchMode = Exclude<QuerySubjectMatchType, "graph_fallback">;
+
+export async function searchRegistrySubjectsByModeReadOnly(args: {
   query: string;
+  mode: RegistrySearchMode;
   limit?: number;
   allowedKinds?: SubjectKind[];
 }): Promise<SubjectSearchHit[]> {
@@ -480,31 +730,33 @@ export async function searchRegistrySubjectsReadOnly(args: {
   try {
     const hits = new Map<string, SubjectSearchHit>();
 
-    const exactHits = await qdrantClient.scroll(config.qdrant.registryCollectionName, {
-      limit: Math.max(10, limit * 2),
-      with_payload: true,
-      with_vector: false,
-      filter: {
-        must: [
-          { key: "entryKind", match: { value: "subject" } },
-          { key: "normalizedLabel", match: { value: normalizedQuery } },
-        ],
-      },
-    });
+    if (args.mode === "exact") {
+      const exactHits = await qdrantClient.scroll(config.qdrant.registryCollectionName, {
+        limit: Math.max(10, limit * 2),
+        with_payload: true,
+        with_vector: false,
+        filter: {
+          must: [
+            { key: "entryKind", match: { value: "subject" } },
+            { key: "normalizedLabel", match: { value: normalizedQuery } },
+          ],
+        },
+      });
 
-    for (const point of exactHits.points) {
-      const hit = point.payload ? subjectHitFromPayload({
-        payload: point.payload as Record<string, unknown>,
-        matchedQuery: args.query,
-        matchType: "exact",
-        matchScore: 1,
-      }) : null;
-      if (hit && kindAllowed(hit.kind, allowedKinds)) {
-        hits.set(hit.canonicalId, hit);
+      for (const point of exactHits.points) {
+        const hit = point.payload ? subjectHitFromPayload({
+          payload: point.payload as Record<string, unknown>,
+          matchedQuery: args.query,
+          matchType: "exact",
+          matchScore: 1,
+        }) : null;
+        if (hit && kindAllowed(hit.kind, allowedKinds)) {
+          hits.set(hit.canonicalId, hit);
+        }
       }
     }
 
-    if (hits.size < limit) {
+    if (args.mode === "alias") {
       const aliasHits = await qdrantClient.scroll(config.qdrant.registryCollectionName, {
         limit: Math.max(10, limit * 3),
         with_payload: true,
@@ -528,7 +780,7 @@ export async function searchRegistrySubjectsReadOnly(args: {
       }
     }
 
-    if (hits.size === 0) {
+    if (args.mode === "vector") {
       const vector = await textToVector(args.query);
       const vectorHits = await qdrantClient.search(config.qdrant.registryCollectionName, {
         vector,
@@ -573,6 +825,357 @@ export async function searchRegistrySubjectsReadOnly(args: {
     return Array.from(hits.values()).slice(0, limit);
   } catch {
     return [];
+  }
+}
+
+export async function inspectVectorRegistryCandidatesReadOnly(args: {
+  query: string;
+  limit?: number;
+  allowedKinds?: SubjectKind[];
+}): Promise<VectorSubjectCandidateInspection[]> {
+  const limit = clampResultLimit(args.limit, 3);
+  const allowedKinds = args.allowedKinds && args.allowedKinds.length > 0 ? args.allowedKinds : DEFAULT_SUBJECT_KINDS;
+  const normalizedQuery = normalizeText(args.query);
+
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  try {
+    const vector = await textToVector(args.query);
+    const vectorHits = await qdrantClient.search(config.qdrant.registryCollectionName, {
+      vector,
+      limit: Math.max(10, limit * 4),
+      with_payload: true,
+      filter: {
+        must: [{ key: "entryKind", match: { value: "subject" } }],
+      },
+    });
+
+    const candidates = new Map<string, VectorSubjectCandidateInspection>();
+    for (const point of vectorHits) {
+      const payload = point.payload as Record<string, unknown> | undefined;
+      if (!payload) {
+        continue;
+      }
+
+      const hit = subjectHitFromPayload({
+        payload,
+        matchedQuery: args.query,
+        matchType: "vector",
+        matchScore: Number(point.score ?? 0),
+      });
+      if (!hit || !kindAllowed(hit.kind, allowedKinds) || candidates.has(hit.canonicalId)) {
+        continue;
+      }
+
+      const inspection = inspectConservativeVectorMatch({
+        kind: hit.kind,
+        score: hit.matchScore,
+        inputLabel: args.query,
+        candidateLabel: hit.label,
+        inputAliases: [],
+        candidateAliases: hit.aliases,
+      });
+
+      candidates.set(hit.canonicalId, {
+        ...hit,
+        accepted: inspection.accepted,
+        rejectionReason: inspection.rejectionReason,
+        threshold: inspection.threshold,
+        semanticCoverage: semanticCoverage(args.query, hit.label),
+        lexicalOverlap: lexicalOverlapRatio(args.query, hit.label),
+      });
+    }
+
+    return Array.from(candidates.values()).sort((left, right) =>
+      right.matchScore - left.matchScore
+      || right.semanticCoverage - left.semanticCoverage
+      || right.lexicalOverlap - left.lexicalOverlap,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function graphCandidateMatchScore(candidate: GraphConceptCandidate): number {
+  return Number((candidate.semanticCoverage + (candidate.lexicalOverlap * 0.1)).toFixed(4));
+}
+
+function graphKindRank(kind: SubjectKind): number {
+  switch (kind) {
+    case "topic":
+      return 3;
+    case "position":
+      return 2;
+    case "entity":
+      return 1;
+    case "ideology":
+      return 0;
+  }
+}
+
+export async function searchGraphConceptCandidatesReadOnly(args: {
+  session: Neo4jReadSessionLike;
+  query: string;
+  limit?: number;
+  allowedKinds?: SubjectKind[];
+}): Promise<GraphConceptCandidate[]> {
+  const limit = clampResultLimit(args.limit, 3);
+  const allowedKinds = args.allowedKinds && args.allowedKinds.length > 0 ? args.allowedKinds : DEFAULT_SUBJECT_KINDS;
+  const queryNeedles = dedupeStrings(
+    meaningfulTokens(args.query).flatMap((token) => [token, ...(QUERY_TOKEN_SYNONYMS[token] ?? [])]),
+  );
+
+  if (queryNeedles.length === 0) {
+    return [];
+  }
+
+  const rows = await args.session.executeRead(async (tx) => {
+    const result = await tx.run(
+      `
+      MATCH (s:Subject)
+      WHERE s.kind IN $allowedKinds
+        AND any(needle IN $queryNeedles WHERE toLower(coalesce(s.label, "")) CONTAINS needle)
+      OPTIONAL MATCH (aTarget:Assertion)-[:TARGETS]->(s)
+      WITH s, count(DISTINCT aTarget) AS targetAssertionCount
+      OPTIONAL MATCH (aTopic:Assertion)-[:ABOUT]->(s)
+      RETURN s.canonicalId AS canonicalId,
+             s.label AS label,
+             s.kind AS kind,
+             s.topicCanonicalId AS topicCanonicalId,
+             targetAssertionCount + count(DISTINCT aTopic) AS assertionCount
+      LIMIT $candidateLimit
+      `,
+      {
+        allowedKinds,
+        queryNeedles,
+        candidateLimit: neo4j.int(Math.max(20, limit * 12)),
+      },
+    );
+
+    return result.records.map((record) => ({
+      canonicalId: String(record.get("canonicalId") ?? ""),
+      label: String(record.get("label") ?? ""),
+      kind: String(record.get("kind") ?? "topic") as SubjectKind,
+      topicCanonicalId: toOptionalString(record.get("topicCanonicalId")),
+      assertionCount: toNumber(record.get("assertionCount")),
+    }));
+  });
+
+  return rows
+    .map((row) => {
+      const candidate: GraphConceptCandidate = {
+        canonicalId: row.canonicalId,
+        label: row.label,
+        kind: row.kind,
+        topicCanonicalId: row.topicCanonicalId,
+        assertionCount: row.assertionCount,
+        lexicalOverlap: lexicalOverlapRatio(args.query, row.label),
+        semanticCoverage: semanticCoverage(args.query, row.label),
+        accepted: false,
+      };
+
+      candidate.accepted = labelMatchesQueryExactly(row.label, args.query)
+        || candidate.semanticCoverage >= 0.75
+        || candidate.lexicalOverlap >= 0.65;
+
+      return candidate;
+    })
+    .sort((left, right) =>
+      Number(right.accepted) - Number(left.accepted)
+      || right.semanticCoverage - left.semanticCoverage
+      || right.lexicalOverlap - left.lexicalOverlap
+      || right.assertionCount - left.assertionCount
+      || graphKindRank(right.kind) - graphKindRank(left.kind),
+    );
+}
+
+export async function searchGraphFallbackSubjectsReadOnly(args: {
+  session: Neo4jReadSessionLike;
+  query: string;
+  limit?: number;
+  allowedKinds?: SubjectKind[];
+}): Promise<SubjectSearchHit[]> {
+  const limit = clampResultLimit(args.limit, 3);
+  const candidates = await searchGraphConceptCandidatesReadOnly(args);
+
+  return candidates
+    .filter((candidate) => candidate.accepted)
+    .slice(0, limit)
+    .map((candidate) => ({
+      canonicalId: candidate.canonicalId,
+      label: candidate.label,
+      kind: candidate.kind,
+      aliases: [],
+      matchType: "graph_fallback",
+      matchScore: graphCandidateMatchScore(candidate),
+      matchedQuery: args.query,
+    }));
+}
+
+export async function searchRegistrySubjectsReadOnly(args: {
+  query: string;
+  limit?: number;
+  allowedKinds?: SubjectKind[];
+}): Promise<SubjectSearchHit[]> {
+  const exactHits = await searchRegistrySubjectsByModeReadOnly({
+    ...args,
+    mode: "exact",
+  });
+  if (exactHits.length > 0) {
+    return exactHits;
+  }
+
+  const aliasHits = await searchRegistrySubjectsByModeReadOnly({
+    ...args,
+    mode: "alias",
+  });
+  if (aliasHits.length > 0) {
+    return aliasHits;
+  }
+
+  return searchRegistrySubjectsByModeReadOnly({
+    ...args,
+    mode: "vector",
+  });
+}
+
+function classifyConceptResolutionRootCause(inspection: {
+  query: string;
+  exactHits: SubjectSearchHit[];
+  aliasHits: SubjectSearchHit[];
+  vectorAcceptedHits: SubjectSearchHit[];
+  vectorCandidates: VectorSubjectCandidateInspection[];
+  graphCandidates: GraphConceptCandidate[];
+}): ConceptResolutionRootCause | null {
+  const exactHit = inspection.exactHits[0] ?? null;
+  const aliasHit = inspection.aliasHits[0] ?? null;
+  const vectorAcceptedHit = inspection.vectorAcceptedHits[0] ?? null;
+  const graphHit = inspection.graphCandidates.find((candidate) => candidate.accepted) ?? null;
+  const vectorTooConservativeCandidate = inspection.vectorCandidates.find((candidate) =>
+    !candidate.accepted
+    && candidate.rejectionReason === "lexical_overlap_below_threshold"
+    && candidate.semanticCoverage >= 0.75,
+  );
+
+  if (exactHit && labelMatchesQueryExactly(exactHit.label, inspection.query)) {
+    return null;
+  }
+
+  if (aliasHit && (labelMatchesQueryExactly(aliasHit.label, inspection.query) || aliasHit.aliases.some((alias) => labelMatchesQueryExactly(alias, inspection.query)))) {
+    return null;
+  }
+
+  if (vectorAcceptedHit && labelMatchesQueryExactly(vectorAcceptedHit.label, inspection.query)) {
+    return null;
+  }
+
+  if (vectorAcceptedHit) {
+    return "different_label_or_alias_gap";
+  }
+
+  if (vectorTooConservativeCandidate) {
+    return "vector_too_conservative";
+  }
+
+  if (aliasHit || graphHit) {
+    if (graphHit && labelMatchesQueryExactly(graphHit.label, inspection.query)) {
+      return "missing_from_registry";
+    }
+
+    return "different_label_or_alias_gap";
+  }
+
+  return "no_candidate_anywhere";
+}
+
+export async function inspectConceptResolutionReadOnly(args: {
+  session: Neo4jReadSessionLike;
+  query: string;
+  limit?: number;
+  allowedKinds?: SubjectKind[];
+}): Promise<ConceptResolutionInspection> {
+  const allowedKinds = args.allowedKinds && args.allowedKinds.length > 0 ? args.allowedKinds : DEFAULT_SUBJECT_KINDS;
+  const exactHits = await searchRegistrySubjectsByModeReadOnly({
+    query: args.query,
+    mode: "exact",
+    limit: args.limit,
+    allowedKinds,
+  });
+  const aliasHits = await searchRegistrySubjectsByModeReadOnly({
+    query: args.query,
+    mode: "alias",
+    limit: args.limit,
+    allowedKinds,
+  });
+  const vectorAcceptedHits = await searchRegistrySubjectsByModeReadOnly({
+    query: args.query,
+    mode: "vector",
+    limit: args.limit,
+    allowedKinds,
+  });
+  const vectorCandidates = await inspectVectorRegistryCandidatesReadOnly({
+    query: args.query,
+    limit: args.limit,
+    allowedKinds,
+  });
+  const graphCandidates = await searchGraphConceptCandidatesReadOnly({
+    session: args.session,
+    query: args.query,
+    limit: args.limit,
+    allowedKinds,
+  });
+  const graphFallbackHits = graphCandidates
+    .filter((candidate) => candidate.accepted)
+    .slice(0, clampResultLimit(args.limit, 3))
+    .map((candidate) => ({
+      canonicalId: candidate.canonicalId,
+      label: candidate.label,
+      kind: candidate.kind,
+      aliases: [],
+      matchType: "graph_fallback" as const,
+      matchScore: graphCandidateMatchScore(candidate),
+      matchedQuery: args.query,
+    }));
+
+  return {
+    query: args.query,
+    normalizedQuery: normalizeText(args.query),
+    allowedKinds,
+    exactHits,
+    aliasHits,
+    vectorAcceptedHits,
+    vectorCandidates,
+    graphCandidates,
+    graphFallbackHits,
+    rootCause: classifyConceptResolutionRootCause({
+      query: args.query,
+      exactHits,
+      aliasHits,
+      vectorAcceptedHits,
+      vectorCandidates,
+      graphCandidates,
+    }),
+  };
+}
+
+export async function inspectConceptResolution(args: {
+  query: string;
+  limit?: number;
+  allowedKinds?: SubjectKind[];
+}): Promise<ConceptResolutionInspection> {
+  const session = neo4jDriver.session({ database: config.neo4j.database });
+
+  try {
+    return await inspectConceptResolutionReadOnly({
+      session,
+      query: args.query,
+      limit: args.limit,
+      allowedKinds: args.allowedKinds,
+    });
+  } finally {
+    await session.close();
   }
 }
 
@@ -689,16 +1292,110 @@ export async function resolveQueryUsersReadOnly(args: {
   return Array.from(resolved.values());
 }
 
-export async function fetchAssertionsReadOnly(args: {
+function normalizeCohortParams(cohort: QueryCohort | null | undefined): {
+  locationRefs: string[];
+  locationRefsLower: string[];
+  genderRefs: string[];
+  genderRefsLower: string[];
+} {
+  const locationRefs = dedupeStrings((cohort?.locationRefs ?? []).map(normalizeText).filter(Boolean));
+  const genderRefs = dedupeStrings((cohort?.genderRefs ?? []).map(normalizeText).filter(Boolean));
+
+  return {
+    locationRefs,
+    locationRefsLower: dedupeStrings((cohort?.locationRefs ?? []).map((value) => value.trim().toLowerCase()).filter(Boolean)),
+    genderRefs,
+    genderRefsLower: dedupeStrings((cohort?.genderRefs ?? []).map((value) => value.trim().toLowerCase()).filter(Boolean)),
+  };
+}
+
+const COHORT_FILTER_CYPHER = `
+  AND (
+    size($cohortLocationRefs) = 0 OR
+    EXISTS {
+      MATCH (u)-[:IN_COUNTRY]->(country:Country)
+      WHERE country.normalizedName IN $cohortLocationRefs
+    } OR
+    EXISTS {
+      MATCH (u)-[:IN_STATE]->(state:State)
+      WHERE state.normalizedName IN $cohortLocationRefs
+    } OR
+    EXISTS {
+      MATCH (u)-[:IN_CITY]->(city:City)
+      WHERE city.normalizedName IN $cohortLocationRefs
+    } OR
+    toLower(coalesce(u.country, "")) IN $cohortLocationRefsLower OR
+    toLower(coalesce(u.state, "")) IN $cohortLocationRefsLower OR
+    toLower(coalesce(u.city, "")) IN $cohortLocationRefsLower
+  )
+  AND (
+    size($cohortGenderRefs) = 0 OR
+    EXISTS {
+      MATCH (u)-[:HAS_GENDER]->(gender:Gender)
+      WHERE gender.normalizedName IN $cohortGenderRefs
+    } OR
+    toLower(coalesce(u.gender, "")) IN $cohortGenderRefsLower
+  )
+`;
+
+export async function countCohortUsersReadOnly(args: {
+  session: Neo4jReadSessionLike;
+  cohort: QueryCohort | null;
+  userIds?: string[];
+}): Promise<number> {
+  const cohortParams = normalizeCohortParams(args.cohort);
+
+  return args.session.executeRead(async (tx) => {
+    const result = await tx.run(
+      `
+      MATCH (u:User)
+      WHERE (size($userIds) = 0 OR u.externalAccountId IN $userIds)
+      ${COHORT_FILTER_CYPHER}
+      RETURN count(DISTINCT u) AS totalUsers
+      `,
+      {
+        userIds: args.userIds ?? [],
+        cohortLocationRefs: cohortParams.locationRefs,
+        cohortLocationRefsLower: cohortParams.locationRefsLower,
+        cohortGenderRefs: cohortParams.genderRefs,
+        cohortGenderRefsLower: cohortParams.genderRefsLower,
+      },
+    );
+
+    return toNumber(result.records[0]?.get("totalUsers"));
+  });
+}
+
+export async function fetchClusterMetricsReadOnly(args: {
   session: Neo4jReadSessionLike;
   candidate: SubjectSearchHit | null;
+  cohort: QueryCohort | null;
   userIds: string[];
   relationFamilies: QueryRelationFamily[];
   polarityFilter?: RelationPolarity;
-  limit: number;
-}): Promise<RetrievedAssertion[]> {
+}): Promise<QueryClusterMetrics> {
+  const totalUsers = await countCohortUsersReadOnly({
+    session: args.session,
+    cohort: args.cohort,
+    userIds: args.userIds,
+  });
+
+  if (totalUsers === 0) {
+    return {
+      totalUsers: 0,
+      matchedUsers: 0,
+      positiveUsers: 0,
+      negativeUsers: 0,
+      neutralUsers: 0,
+      positivePct: 0,
+      negativePct: 0,
+      neutralPct: 0,
+      averageIntensity: null,
+    };
+  }
+
+  const cohortParams = normalizeCohortParams(args.cohort);
   const nowIso = new Date().toISOString();
-  const resultLimit = clampResultLimit(args.limit);
 
   return args.session.executeRead(async (tx) => {
     const result = await tx.run(
@@ -719,6 +1416,103 @@ export async function fetchAssertionsReadOnly(args: {
           ($candidateKind = "topic" AND (topic.canonicalId = $candidateId OR target.topicCanonicalId = $candidateId)) OR
           ($candidateKind <> "topic" AND target.canonicalId = $candidateId)
         )
+        ${COHORT_FILTER_CYPHER}
+      WITH u, a, opp, suppression,
+           CASE
+             WHEN a.lastIntensityDecayAt IS NULL THEN coalesce(a.intensityMass, 0.0)
+             ELSE coalesce(a.intensityMass, 0.0) * exp(-lambda * duration.between(datetime(a.lastIntensityDecayAt), now).seconds)
+           END AS ownMassNow,
+           CASE
+             WHEN opp IS NULL OR opp.lastIntensityDecayAt IS NULL THEN coalesce(opp.intensityMass, 0.0)
+             ELSE coalesce(opp.intensityMass, 0.0) * exp(-lambda * duration.between(datetime(opp.lastIntensityDecayAt), now).seconds)
+           END AS oppositeMassNow
+      WITH u, a,
+           1 - exp(
+             -CASE
+               WHEN ownMassNow - suppression * oppositeMassNow < 0.0 THEN 0.0
+               ELSE ownMassNow - suppression * oppositeMassNow
+             END
+           ) AS exactNowIntensity
+      ORDER BY u.externalAccountId, exactNowIntensity DESC, coalesce(a.confidence, 0.0) DESC, coalesce(a.lastSeenAt, "") DESC
+      WITH u, collect({polarity: a.polarity, intensity: exactNowIntensity})[0] AS strongest
+      RETURN count(DISTINCT u) AS matchedUsers,
+             count(DISTINCT CASE WHEN strongest.polarity = 'positive' THEN u END) AS positiveUsers,
+             count(DISTINCT CASE WHEN strongest.polarity = 'negative' THEN u END) AS negativeUsers,
+             count(DISTINCT CASE WHEN strongest.polarity = 'neutral' THEN u END) AS neutralUsers,
+             avg(strongest.intensity) AS averageIntensity
+      `,
+      {
+        nowIso,
+        halfLifeDays: config.intensity.halfLifeDays,
+        suppression: config.intensity.oppositeSuppression,
+        userIds: args.userIds,
+        relationFamilies: args.relationFamilies,
+        polarityFilter: args.polarityFilter ?? null,
+        candidateId: args.candidate?.canonicalId ?? null,
+        candidateKind: args.candidate?.kind ?? null,
+        cohortLocationRefs: cohortParams.locationRefs,
+        cohortLocationRefsLower: cohortParams.locationRefsLower,
+        cohortGenderRefs: cohortParams.genderRefs,
+        cohortGenderRefsLower: cohortParams.genderRefsLower,
+      },
+    );
+
+    const matchedUsers = toNumber(result.records[0]?.get("matchedUsers"));
+    const positiveUsers = toNumber(result.records[0]?.get("positiveUsers"));
+    const negativeUsers = toNumber(result.records[0]?.get("negativeUsers"));
+    const neutralUsers = toNumber(result.records[0]?.get("neutralUsers"));
+    const averageIntensityRaw = result.records[0]?.get("averageIntensity");
+    const averageIntensity = averageIntensityRaw === null || averageIntensityRaw === undefined
+      ? null
+      : toNumber(averageIntensityRaw);
+
+    return {
+      totalUsers,
+      matchedUsers,
+      positiveUsers,
+      negativeUsers,
+      neutralUsers,
+      positivePct: totalUsers > 0 ? (positiveUsers / totalUsers) * 100 : 0,
+      negativePct: totalUsers > 0 ? (negativeUsers / totalUsers) * 100 : 0,
+      neutralPct: totalUsers > 0 ? (neutralUsers / totalUsers) * 100 : 0,
+      averageIntensity,
+    };
+  });
+}
+
+export async function fetchAssertionsReadOnly(args: {
+  session: Neo4jReadSessionLike;
+  candidate: SubjectSearchHit | null;
+  cohort?: QueryCohort | null;
+  userIds: string[];
+  relationFamilies: QueryRelationFamily[];
+  polarityFilter?: RelationPolarity;
+  limit: number;
+}): Promise<RetrievedAssertion[]> {
+  const nowIso = new Date().toISOString();
+  const resultLimit = clampResultLimit(args.limit);
+  const cohortParams = normalizeCohortParams(args.cohort);
+
+  return args.session.executeRead(async (tx) => {
+    const result = await tx.run(
+      `
+      WITH datetime($nowIso) AS now,
+           log(2.0) / ($halfLifeDays * 86400.0) AS lambda,
+           $suppression AS suppression
+      MATCH (u:User)-[:MADE_ASSERTION]->(a:Assertion)-[:TARGETS]->(target:Subject)
+      OPTIONAL MATCH (a)-[:ABOUT]->(topic:Topic)
+      OPTIONAL MATCH (opp:Assertion {assertionGroupKey: a.assertionGroupKey})
+      WITH u, a, target, topic, [candidate IN collect(opp) WHERE candidate IS NOT NULL AND candidate.polarity <> a.polarity][0] AS opp,
+           now, lambda, suppression
+      WHERE (size($userIds) = 0 OR u.externalAccountId IN $userIds)
+        AND (size($relationFamilies) = 0 OR a.relationFamily IN $relationFamilies)
+        AND ($polarityFilter IS NULL OR a.polarity = $polarityFilter)
+        AND (
+          $candidateId IS NULL OR
+          ($candidateKind = "topic" AND (topic.canonicalId = $candidateId OR target.topicCanonicalId = $candidateId)) OR
+          ($candidateKind <> "topic" AND target.canonicalId = $candidateId)
+        )
+        ${COHORT_FILTER_CYPHER}
       WITH u, a, target, topic, opp, suppression,
            CASE
              WHEN a.lastIntensityDecayAt IS NULL THEN coalesce(a.intensityMass, 0.0)
@@ -768,6 +1562,10 @@ export async function fetchAssertionsReadOnly(args: {
         polarityFilter: args.polarityFilter ?? null,
         candidateId: args.candidate?.canonicalId ?? null,
         candidateKind: args.candidate?.kind ?? null,
+        cohortLocationRefs: cohortParams.locationRefs,
+        cohortLocationRefsLower: cohortParams.locationRefsLower,
+        cohortGenderRefs: cohortParams.genderRefs,
+        cohortGenderRefsLower: cohortParams.genderRefsLower,
         limit: neo4j.int(resultLimit),
       },
     );
@@ -926,6 +1724,7 @@ function buildUnsupportedAnswer(question: string, intent: QueryIntent): Grounded
     question,
     intent,
     matchedUsers: [],
+    cohorts: intent.cohorts,
     matchedConcepts: [],
     clusters: [],
     warnings: [],
@@ -939,30 +1738,142 @@ function formatAssertionLine(assertion: RetrievedAssertion): string {
   return `- ${assertion.user.username ?? assertion.user.externalAccountId} ${assertion.relationLabel} ${assertion.target.label}${topicPart} (intensity ${assertion.exactNowIntensity.toFixed(2)}, confidence ${assertion.confidence.toFixed(2)})`;
 }
 
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function buildClusterLabel(cluster: QueryResultCluster): string {
+  const labelParts = [cluster.cohort?.label, cluster.matchedConcept?.label].filter(Boolean);
+  return labelParts.length > 0 ? labelParts.join(" | ") : "the retrieved result set";
+}
+
+function formatMatchTypeLabel(matchType: QuerySubjectMatchType): string {
+  if (matchType === "graph_fallback") {
+    return "graph fallback";
+  }
+
+  return matchType;
+}
+
+function isConceptResolutionBlocked(answer: GroundedQueryAnswer): boolean {
+  return answer.intent.conceptRefs.length > 0
+    && answer.matchedConcepts.length > 0
+    && answer.matchedConcepts.every((concept) => concept.hits.length === 0);
+}
+
+function buildVerboseReport(answer: GroundedQueryAnswer): string[] {
+  const clusterCount = answer.clusters.length;
+  const assertionCount = answer.clusters.reduce((sum, cluster) => sum + cluster.assertions.length, 0);
+  const evidenceCount = answer.clusters.reduce(
+    (sum, cluster) => sum + cluster.assertions.filter((assertion) => assertion.evidence.length > 0).length,
+    0,
+  );
+
+  if (clusterCount === 0) {
+    if (isConceptResolutionBlocked(answer)) {
+      return [
+        "- Retrieval coverage: No concept cluster was resolved, so graph assertions and cohort metrics were not retrieved for this query.",
+        "- Main blocker: The requested concept could not be matched to a known subject through registry lookup or graph fallback search.",
+        answer.warnings.length > 0
+          ? `- Caveats: ${answer.warnings.join(" ")}`
+          : "- Caveats: No additional warnings were raised, but concept resolution failed before evidence-backed retrieval could begin.",
+      ];
+    }
+
+    return [
+      "- Retrieval coverage: No concept clusters or assertion-backed results were retrieved for this query.",
+      answer.warnings.length > 0
+        ? `- Caveats: ${answer.warnings.join(" ")}`
+        : "- Caveats: No additional warnings were raised, but the graph did not surface enough linked evidence to answer confidently.",
+    ];
+  }
+
+  const report: string[] = [
+    `- Retrieval coverage: The query matched ${pluralize(clusterCount, "concept cluster")}, produced ${pluralize(assertionCount, "assertion")}, and attached evidence to ${pluralize(evidenceCount, "assertion")}.`,
+  ];
+
+  const firstCluster = answer.clusters[0];
+  if (firstCluster?.matchedConcept) {
+    const conceptPrefix = firstCluster.cohort ? `${firstCluster.cohort.label} -> ` : "";
+    report.push(
+      `- Main match: The leading cluster is ${conceptPrefix}${firstCluster.matchedConcept.label}, classified as ${firstCluster.matchedConcept.kind} via ${formatMatchTypeLabel(firstCluster.matchedConcept.matchType)} matching.`,
+    );
+  }
+
+  const metricClusters = answer.clusters.filter((cluster) => cluster.metrics);
+  if (metricClusters.length > 0) {
+    for (const cluster of metricClusters.slice(0, 2)) {
+      const metrics = cluster.metrics!;
+      report.push(
+        `- Cohort readout: For ${buildClusterLabel(cluster)}, ${metrics.matchedUsers} of ${metrics.totalUsers} users matched the current filter. The distribution is ${metrics.positivePct.toFixed(1)}% positive, ${metrics.negativePct.toFixed(1)}% negative, and ${metrics.neutralPct.toFixed(1)}% neutral${metrics.averageIntensity === null ? "." : `, with an average current intensity of ${metrics.averageIntensity.toFixed(2)}.`}`,
+      );
+    }
+  } else if (assertionCount > 0) {
+    const topAssertion = answer.clusters
+      .flatMap((cluster) => cluster.assertions)
+      .sort((left, right) => right.exactNowIntensity - left.exactNowIntensity)[0];
+    if (topAssertion) {
+      report.push(
+        `- Strongest signal: The highest-intensity retrieved stance is ${topAssertion.user.username ?? topAssertion.user.externalAccountId} ${topAssertion.relationLabel} ${topAssertion.target.label}${topAssertion.aboutTopic ? ` about ${topAssertion.aboutTopic.label}` : ""}, with intensity ${topAssertion.exactNowIntensity.toFixed(2)} and confidence ${topAssertion.confidence.toFixed(2)}.`,
+      );
+    }
+  }
+
+  if (answer.warnings.length > 0) {
+    report.push(`- Caveats: ${answer.warnings.join(" ")}`);
+  } else {
+    report.push("- Caveats: No retrieval warnings were raised for this answer.");
+  }
+
+  return report;
+}
+
 export function renderDeterministicAnswer(answer: GroundedQueryAnswer): string {
   if (!answer.intent.supported) {
     return answer.answerText;
   }
 
   if (answer.clusters.length === 0) {
-    const lines = [
-      "No strong matching assertions were found for that query.",
-    ];
+    const conceptResolutionBlocked = isConceptResolutionBlocked(answer);
+    const lines = [conceptResolutionBlocked
+      ? "The query could not be answered because the concept did not resolve to a known subject in the registry or graph fallback search."
+      : (answer.warnings.includes("The user and concept matched separately, but no assertion links them in the current graph.")
+          ? "The user and concept matched, but no connecting assertions were found in the current graph."
+          : "No strong matching assertions were found for that query.")];
+
+    if (conceptResolutionBlocked && answer.intent.cohorts.length > 0) {
+      lines.push("Graph metrics and cohort comparison were skipped because concept resolution failed before graph retrieval.");
+    }
+
     if (answer.warnings.length > 0) {
       lines.push("", "Warnings:");
       for (const warning of answer.warnings) {
         lines.push(`- ${warning}`);
       }
     }
+
+    lines.push("", "Verbose Report:");
+    lines.push(...buildVerboseReport(answer));
+
     return lines.join("\n");
   }
 
   const lines: string[] = [];
 
   for (const cluster of answer.clusters) {
+    if (cluster.cohort) {
+      lines.push(`Cohort: ${cluster.cohort.label}`);
+    }
+
     if (cluster.matchedConcept) {
       lines.push(
-        `Concept cluster: ${cluster.matchedConcept.label} (${cluster.matchedConcept.kind}, ${cluster.matchedConcept.matchType})`,
+        `Concept cluster: ${cluster.matchedConcept.label} (${cluster.matchedConcept.kind}, ${formatMatchTypeLabel(cluster.matchedConcept.matchType)})`,
+      );
+    }
+
+    if (cluster.metrics) {
+      lines.push(
+        `  Metrics: total ${cluster.metrics.totalUsers}, matched ${cluster.metrics.matchedUsers}, positive ${cluster.metrics.positivePct.toFixed(1)}%, negative ${cluster.metrics.negativePct.toFixed(1)}%, neutral ${cluster.metrics.neutralPct.toFixed(1)}%${cluster.metrics.averageIntensity === null ? "" : `, avg intensity ${cluster.metrics.averageIntensity.toFixed(2)}`}`,
       );
     }
 
@@ -985,11 +1896,15 @@ export function renderDeterministicAnswer(answer: GroundedQueryAnswer): string {
     }
   }
 
+  lines.push("", "Verbose Report:");
+  lines.push(...buildVerboseReport(answer));
+
   return lines.join("\n").trim();
 }
 
 async function synthesizeGroundedAnswer(answer: GroundedQueryAnswer): Promise<string> {
   const usesRealtimeModel = REALTIME_MODEL_PATTERN.test(config.openai.model);
+  const storageContract = buildQueryStorageContract(2000);
 
   const response = await openaiClient.responses.create({
     model: config.openai.model,
@@ -1004,8 +1919,13 @@ async function synthesizeGroundedAnswer(answer: GroundedQueryAnswer): Promise<st
               "Stay strictly within the retrieved evidence.",
               "Do not invent facts, hidden motivations, or unified concepts that are not explicitly retrieved.",
               "If multiple nearby concept clusters are present, mention that they are related but not fully unified in the current graph.",
+              "If a user and concept matched but no linking assertions were retrieved, say that explicitly.",
               "Keep the answer concise and terminal-friendly.",
               "After the short answer, include a compact evidence section with bullet points.",
+              "Always end with a 'Verbose Report' section of 3-6 bullets.",
+              "Each bullet in 'Verbose Report' must be a full sentence that explains retrieval coverage, the most relevant cluster or cohort metrics, notable retrieved signals, and any warnings or caveats.",
+              "Do not use a 'Summary' heading.",
+              storageContract,
             ].join(" "),
           },
         ],
@@ -1050,38 +1970,6 @@ function allowedKindsForIntent(intent: QueryIntent): SubjectKind[] {
   return DEFAULT_SUBJECT_KINDS;
 }
 
-function buildWarnings(args: {
-  intent: QueryIntent;
-  matchedUsers: ResolvedQueryUser[];
-  matchedConcepts: Array<{ query: string; hits: SubjectSearchHit[] }>;
-}): string[] {
-  const warnings: string[] = [];
-
-  if (
-    ["user_summary", "user_concept_summary", "user_entity_sentiment", "compare_users_on_concept"].includes(args.intent.intentType)
-    && args.intent.userRefs.length > 0
-    && args.matchedUsers.length === 0
-  ) {
-    warnings.push(`No graph user matched: ${args.intent.userRefs.join(", ")}.`);
-  }
-
-  if (args.intent.intentType === "compare_users_on_concept" && args.matchedUsers.length < 2) {
-    warnings.push("The current graph query needs two matched users for a comparison.");
-  }
-
-  for (const concept of args.matchedConcepts) {
-    if (concept.hits.length === 0) {
-      warnings.push(`No subject-registry concept matched: ${concept.query}.`);
-    } else if (concept.hits.length > 1) {
-      warnings.push(
-        `The graph returned multiple related concept clusters for "${concept.query}"; the answer keeps them separate instead of merging them.`,
-      );
-    }
-  }
-
-  return warnings;
-}
-
 export async function runTerminalGraphQuery(args: {
   question: string;
   limit?: number;
@@ -1103,11 +1991,45 @@ export async function runTerminalGraphQuery(args: {
     const matchedConcepts = await Promise.all(
       intent.conceptRefs.map(async (query) => ({
         query,
-        hits: await searchRegistrySubjectsReadOnly({
-          query,
-          limit: 3,
-          allowedKinds: allowedKindsForIntent(intent),
-        }),
+        hits: await (async () => {
+          const allowedKinds = allowedKindsForIntent(intent);
+          const exactHits = await searchRegistrySubjectsByModeReadOnly({
+            query,
+            mode: "exact",
+            limit: 3,
+            allowedKinds,
+          });
+          if (exactHits.length > 0) {
+            return exactHits;
+          }
+
+          const aliasHits = await searchRegistrySubjectsByModeReadOnly({
+            query,
+            mode: "alias",
+            limit: 3,
+            allowedKinds,
+          });
+          if (aliasHits.length > 0) {
+            return aliasHits;
+          }
+
+          const vectorHits = await searchRegistrySubjectsByModeReadOnly({
+            query,
+            mode: "vector",
+            limit: 3,
+            allowedKinds,
+          });
+          if (vectorHits.length > 0) {
+            return vectorHits;
+          }
+
+          return searchGraphFallbackSubjectsReadOnly({
+            session,
+            query,
+            limit: 3,
+            allowedKinds,
+          });
+        })(),
       })),
     );
 
@@ -1116,6 +2038,9 @@ export async function runTerminalGraphQuery(args: {
       matchedUsers,
       matchedConcepts,
     });
+    const conceptResolutionBlocked = intent.conceptRefs.length > 0
+      && matchedConcepts.length > 0
+      && matchedConcepts.every((concept) => concept.hits.length === 0);
 
     if (
       ["user_summary", "user_concept_summary", "user_entity_sentiment", "compare_users_on_concept"].includes(intent.intentType)
@@ -1125,6 +2050,7 @@ export async function runTerminalGraphQuery(args: {
         question: args.question,
         intent,
         matchedUsers,
+        cohorts: intent.cohorts,
         matchedConcepts,
         clusters: [],
         warnings,
@@ -1132,6 +2058,29 @@ export async function runTerminalGraphQuery(args: {
           question: args.question,
           intent,
           matchedUsers,
+          cohorts: intent.cohorts,
+          matchedConcepts,
+          clusters: [],
+          warnings,
+          answerText: "",
+        }),
+      };
+    }
+
+    if (conceptResolutionBlocked) {
+      return {
+        question: args.question,
+        intent,
+        matchedUsers,
+        cohorts: intent.cohorts,
+        matchedConcepts,
+        clusters: [],
+        warnings,
+        answerText: renderDeterministicAnswer({
+          question: args.question,
+          intent,
+          matchedUsers,
+          cohorts: intent.cohorts,
           matchedConcepts,
           clusters: [],
           warnings,
@@ -1147,6 +2096,7 @@ export async function runTerminalGraphQuery(args: {
       const assertions = await fetchAssertionsReadOnly({
         session,
         candidate: null,
+        cohort: null,
         userIds,
         relationFamilies: intent.relationFamilies,
         polarityFilter: intent.polarityFilter,
@@ -1155,39 +2105,66 @@ export async function runTerminalGraphQuery(args: {
       clusters.push({
         queryRef: null,
         matchedConcept: null,
+        cohort: null,
+        metrics: null,
         assertions,
       });
     } else {
+      const activeCohorts = intent.cohorts.length > 0 ? intent.cohorts : [null];
+
       for (const concept of matchedConcepts) {
         for (const hit of concept.hits) {
-          const assertions = await fetchAssertionsReadOnly({
-            session,
-            candidate: hit,
-            userIds: intent.intentType === "concept_cohort_summary" ? [] : userIds,
-            relationFamilies: intent.relationFamilies,
-            polarityFilter: intent.polarityFilter,
-            limit: intent.resultLimit,
-          });
-
-          if (assertions.length > 0) {
-            clusters.push({
-              queryRef: concept.query,
-              matchedConcept: hit,
-              assertions,
+          for (const cohort of activeCohorts) {
+            const assertions = await fetchAssertionsReadOnly({
+              session,
+              candidate: hit,
+              cohort,
+              userIds: intent.intentType === "concept_cohort_summary" ? [] : userIds,
+              relationFamilies: intent.relationFamilies,
+              polarityFilter: intent.polarityFilter,
+              limit: intent.resultLimit,
             });
+
+            const metrics = await fetchClusterMetricsReadOnly({
+              session,
+              candidate: hit,
+              cohort,
+              userIds: intent.intentType === "concept_cohort_summary" ? [] : userIds,
+              relationFamilies: intent.relationFamilies,
+              polarityFilter: intent.polarityFilter,
+            });
+
+            if (assertions.length > 0 || metrics.totalUsers > 0) {
+              clusters.push({
+                queryRef: concept.query,
+                matchedConcept: hit,
+                cohort,
+                metrics,
+                assertions,
+              });
+            }
           }
         }
       }
     }
 
-    const clustersWithEvidence = intent.needsEvidence ? await attachEvidenceSnippets(clusters) : clusters;
-    const baseAnswer: GroundedQueryAnswer = {
-      question: args.question,
+    const clustersWithEvidence = intent.needsEvidence && clusters.some((cluster) => cluster.assertions.length > 0)
+      ? await attachEvidenceSnippets(clusters)
+      : clusters;
+    const postWarnings = buildWarnings({
       intent,
       matchedUsers,
       matchedConcepts,
       clusters: clustersWithEvidence,
-      warnings,
+    });
+    const baseAnswer: GroundedQueryAnswer = {
+      question: args.question,
+      intent,
+      matchedUsers,
+      cohorts: intent.cohorts,
+      matchedConcepts,
+      clusters: clustersWithEvidence,
+      warnings: Array.from(new Set([...warnings, ...postWarnings])),
       answerText: "",
     };
 
